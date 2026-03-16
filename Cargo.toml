@@ -2,6 +2,10 @@
 name = "mutinynet-cli"
 version = "0.1.0"
 edition = "2021"
+description = "CLI tool for the Mutinynet faucet"
+authors = ["Ben Carman <benthecarman@live.com>"]
+license = "MIT"
+repository = "https://github.com/benthecarman/mutinynet-cli"
 
 [dependencies]
 anyhow = "1"
