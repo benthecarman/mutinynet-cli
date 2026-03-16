@@ -87,10 +87,9 @@ fn save_token(token: &str) -> Result<()> {
 }
 
 fn get_token(cli: &Cli) -> Result<String> {
-    cli.token
-        .clone()
-        .or_else(load_token)
-        .context("No token found. Run `mutinynet-cli login` or set --token / MUTINYNET_FAUCET_TOKEN")
+    cli.token.clone().or_else(load_token).context(
+        "No token found. Run `mutinynet-cli login` or set --token / MUTINYNET_FAUCET_TOKEN",
+    )
 }
 
 fn get_json(url: &str) -> Result<Value> {
@@ -110,7 +109,7 @@ fn post_json(url: &str, body: &Value, token: Option<&str>) -> Result<Value> {
         .with_header("Content-Type", "application/json")
         .with_body(json_body.into_bytes());
     if let Some(token) = token {
-        req = req.with_header("Authorization", &format!("Bearer {token}"));
+        req = req.with_header("Authorization", format!("Bearer {token}"));
     }
     let resp = req.send().context("Failed to send request")?;
     if resp.status_code >= 200 && resp.status_code < 300 {
@@ -228,9 +227,7 @@ fn main() -> Result<()> {
             )?;
             println!(
                 "{}",
-                body["payment_hash"]
-                    .as_str()
-                    .unwrap_or(&body.to_string())
+                body["payment_hash"].as_str().unwrap_or(&body.to_string())
             );
         }
         Command::Channel {
@@ -258,10 +255,7 @@ fn main() -> Result<()> {
                 &json!({ "amount_sats": amount }),
                 None,
             )?;
-            println!(
-                "{}",
-                body["bolt11"].as_str().unwrap_or(&body.to_string())
-            );
+            println!("{}", body["bolt11"].as_str().unwrap_or(&body.to_string()));
         }
     }
 
