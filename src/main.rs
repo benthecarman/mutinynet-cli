@@ -26,8 +26,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Authenticate with GitHub
-    Login,
+    /// Authenticate with GitHub or Lightning (L402)
+    Login {
+        /// Use Lightning payment (L402) instead of GitHub
+        #[arg(long)]
+        lightning: bool,
+    },
     /// Request on-chain bitcoin from the faucet
     Onchain {
         /// Bitcoin address or BIP21 URI
@@ -64,15 +68,22 @@ enum Command {
     },
 }
 
-fn token_path() -> PathBuf {
-    let dir = home_dir().join(".mutinynet");
-    dir.join("token")
-}
-
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn data_dir() -> PathBuf {
+    home_dir().join(".mutinynet")
+}
+
+fn token_path() -> PathBuf {
+    data_dir().join("token")
+}
+
+fn l402_path() -> PathBuf {
+    data_dir().join("l402")
 }
 
 fn load_token() -> Option<String> {
@@ -82,19 +93,74 @@ fn load_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn save_token(token: &str) -> Result<()> {
-    let path = token_path();
+fn load_l402() -> Option<(String, String)> {
+    let content = fs::read_to_string(l402_path()).ok()?;
+    let content = content.trim();
+    let (token, preimage) = content.split_once(':')?;
+    if token.is_empty() || preimage.is_empty() {
+        return None;
+    }
+    Some((token.to_string(), preimage.to_string()))
+}
+
+fn save_file(path: &PathBuf, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, token)?;
+    fs::write(path, contents)?;
     Ok(())
 }
 
-fn get_token(cli: &Cli) -> Result<String> {
-    cli.token.clone().or_else(load_token).context(
-        "No token found. Run `mutinynet-cli login` or set --token / MUTINYNET_FAUCET_TOKEN",
-    )
+fn save_token(token: &str) -> Result<()> {
+    save_file(&token_path(), token)
+}
+
+fn save_l402(token: &str, preimage: &str) -> Result<()> {
+    save_file(&l402_path(), &format!("{token}:{preimage}"))
+}
+
+/// Where the auth credentials came from.
+enum AuthSource {
+    /// Passed via --token flag or env var (don't delete anything).
+    Flag,
+    /// Loaded from ~/.mutinynet/l402
+    L402,
+    /// Loaded from ~/.mutinynet/token
+    Token,
+}
+
+/// Build the Authorization header value from stored credentials.
+/// Prefers CLI --token, then L402 credentials, then stored JWT.
+/// Returns the header value and the source so we can clean up on 401.
+fn get_auth_header(cli: &Cli) -> Result<(String, AuthSource)> {
+    if let Some(token) = &cli.token {
+        return Ok((format!("Bearer {token}"), AuthSource::Flag));
+    }
+    if let Some((token, preimage)) = load_l402() {
+        return Ok((format!("L402 {token}:{preimage}"), AuthSource::L402));
+    }
+    if let Some(token) = load_token() {
+        return Ok((format!("Bearer {token}"), AuthSource::Token));
+    }
+    bail!("No token found. Run `mutinynet-cli login` or `mutinynet-cli login --lightning` or set --token / MUTINYNET_FAUCET_TOKEN")
+}
+
+/// Delete stored credentials for the given auth source and return an
+/// informative error telling the user to re-authenticate.
+fn clear_expired_credentials(source: AuthSource) -> Result<Value> {
+    match source {
+        AuthSource::L402 => {
+            let _ = fs::remove_file(l402_path());
+            bail!("Authentication expired. Removed stored L402 credentials.\nRun `mutinynet-cli login --lightning` to re-authenticate.")
+        }
+        AuthSource::Token => {
+            let _ = fs::remove_file(token_path());
+            bail!("Authentication expired. Removed stored token.\nRun `mutinynet-cli login` to re-authenticate.")
+        }
+        AuthSource::Flag => {
+            bail!("Authentication failed. The provided token is invalid or expired.")
+        }
+    }
 }
 
 fn get_json(url: &str) -> Result<Value> {
@@ -108,21 +174,46 @@ fn get_json(url: &str) -> Result<Value> {
     }
 }
 
-fn post_json(url: &str, body: &Value, token: Option<&str>) -> Result<Value> {
+struct ApiResponse {
+    status_code: u16,
+    body: Value,
+}
+
+fn post_json_raw(url: &str, body: &Value, auth: Option<&str>) -> Result<ApiResponse> {
     let json_body = serde_json::to_string(body)?;
     let mut req = bitreq::post(url)
         .with_header("Content-Type", "application/json")
         .with_body(json_body.into_bytes());
-    if let Some(token) = token {
-        req = req.with_header("Authorization", format!("Bearer {token}"));
+    if let Some(auth) = auth {
+        req = req.with_header("Authorization", auth);
     }
     let resp = req.send().context("Failed to send request")?;
+    let status_code = resp.status_code as u16;
+    let text = resp.as_str().unwrap_or("unknown error");
+    let body = serde_json::from_str(text).unwrap_or_else(|_| json!({"error": text}));
+    Ok(ApiResponse { status_code, body })
+}
+
+fn post_json(url: &str, body: &Value, auth: Option<&str>) -> Result<Value> {
+    let resp = post_json_raw(url, body, auth)?;
     if resp.status_code >= 200 && resp.status_code < 300 {
-        let text = resp.as_str()?;
-        Ok(serde_json::from_str(text)?)
+        Ok(resp.body)
     } else {
-        let text = resp.as_str().unwrap_or("unknown error");
-        bail!("{}: {}", resp.status_code, text)
+        bail!("{}: {}", resp.status_code, resp.body)
+    }
+}
+
+/// Make an authenticated POST request. On 401, clear stored credentials and
+/// tell the user to re-authenticate.
+fn authed_post(url: &str, body: &Value, cli: &Cli) -> Result<Value> {
+    let (auth, source) = get_auth_header(cli)?;
+    let resp = post_json_raw(url, body, Some(&auth))?;
+    if resp.status_code == 401 {
+        clear_expired_credentials(source)
+    } else if resp.status_code >= 200 && resp.status_code < 300 {
+        Ok(resp.body)
+    } else {
+        bail!("{}: {}", resp.status_code, resp.body)
     }
 }
 
@@ -140,6 +231,52 @@ fn post_form(url: &str, body: &str) -> Result<Value> {
         let text = resp.as_str().unwrap_or("unknown error");
         bail!("{}: {}", resp.status_code, text)
     }
+}
+
+fn login_lightning(faucet_url: &str) -> Result<()> {
+    // Request L402 challenge from the faucet
+    let resp = post_json(&format!("{faucet_url}/api/l402"), &json!({}), None)?;
+
+    let invoice = resp["invoice"]
+        .as_str()
+        .context("Missing invoice in L402 response")?;
+    let token = resp["token"]
+        .as_str()
+        .context("Missing token in L402 response")?;
+
+    println!("Pay this Lightning invoice to authenticate:");
+    println!();
+    println!("{invoice}");
+    println!();
+    println!("Waiting for payment...");
+
+    // Poll for payment
+    let preimage = loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let check_url = format!("{faucet_url}/api/l402/check?token={token}");
+        let check_resp = get_json(&check_url)?;
+
+        match check_resp["status"].as_str() {
+            Some("settled") => {
+                let preimage = check_resp["preimage"]
+                    .as_str()
+                    .context("Missing preimage in settled response")?
+                    .to_string();
+                break preimage;
+            }
+            Some("expired") => bail!("Invoice expired. Try again."),
+            Some("pending") => continue,
+            other => bail!("Unexpected status: {:?}", other),
+        }
+    };
+
+    save_l402(token, &preimage)?;
+    println!(
+        "Authenticated via Lightning! Credentials saved to {}",
+        l402_path().display()
+    );
+    Ok(())
 }
 
 fn login(faucet_url: &str) -> Result<()> {
@@ -240,13 +377,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Login => login(&cli.url)?,
+        Command::Login { lightning } => {
+            if *lightning {
+                login_lightning(&cli.url)?;
+            } else {
+                login(&cli.url)?;
+            }
+        }
         Command::Onchain { address, sats } => {
-            let token = get_token(&cli)?;
-            let body = post_json(
+            let body = authed_post(
                 &format!("{}/api/onchain", cli.url),
                 &json!({ "address": address, "sats": *sats }),
-                Some(&token),
+                &cli,
             )?;
             println!("{}", body["txid"].as_str().unwrap_or(&body.to_string()));
         }
@@ -256,11 +398,10 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&body)?);
                 return Ok(());
             }
-            let token = get_token(&cli)?;
-            let body = post_json(
+            let body = authed_post(
                 &format!("{}/api/lightning", cli.url),
                 &json!({ "bolt11": bolt11 }),
-                Some(&token),
+                &cli,
             )?;
             println!(
                 "{}",
@@ -273,8 +414,7 @@ fn main() -> Result<()> {
             push_amount,
             host,
         } => {
-            let token = get_token(&cli)?;
-            let body = post_json(
+            let body = authed_post(
                 &format!("{}/api/channel", cli.url),
                 &json!({
                     "pubkey": pubkey,
@@ -282,7 +422,7 @@ fn main() -> Result<()> {
                     "push_amount": *push_amount,
                     "host": host,
                 }),
-                Some(&token),
+                &cli,
             )?;
             println!("{}", body["txid"].as_str().unwrap_or(&body.to_string()));
         }
