@@ -1,8 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use lightning_invoice::Bolt11Invoice;
 use serde_json::{json, Value};
 
 const DEFAULT_URL: &str = "https://faucet.mutinynet.com";
@@ -34,10 +36,13 @@ enum Command {
         #[arg(default_value = "10000")]
         sats: u64,
     },
-    /// Pay a lightning invoice, LNURL, or zap a nostr pubkey
+    /// Pay or decode a lightning invoice, LNURL, or zap a nostr pubkey
     Lightning {
-        /// Bolt11 invoice, LNURL, lightning address, or npub
+        /// Bolt11 invoice to pay or decode, or an LNURL, lightning address, or npub to pay
         bolt11: String,
+        /// Decode a bolt11 invoice instead of paying it
+        #[arg(short = 'd', long = "decode")]
+        decode: bool,
     },
     /// Open a lightning channel from the faucet node
     Channel {
@@ -204,6 +209,33 @@ fn login(faucet_url: &str) -> Result<()> {
     Ok(())
 }
 
+fn decode_invoice(bolt11: &str) -> Result<Value> {
+    let invoice = Bolt11Invoice::from_str(bolt11)
+        .map_err(|err| anyhow::anyhow!("Failed to decode bolt11 invoice: {err}"))?;
+    let expires_at_unix = invoice.expires_at().map(|expiry| expiry.as_secs());
+    let fallback_addresses: Vec<String> = invoice
+        .fallback_addresses()
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect();
+
+    Ok(json!({
+        "invoice": bolt11,
+        "network": format!("{:?}", invoice.currency()),
+        "amount_msat": invoice.amount_milli_satoshis(),
+        "description": invoice.description().to_string(),
+        "payment_hash": invoice.payment_hash().to_string(),
+        "payee_pubkey": invoice.get_payee_pub_key().to_string(),
+        "created_at_unix": invoice.duration_since_epoch().as_secs(),
+        "expiry_secs": invoice.expiry_time().as_secs(),
+        "expires_at_unix": expires_at_unix,
+        "is_expired": invoice.is_expired(),
+        "min_final_cltv_expiry_delta": invoice.min_final_cltv_expiry_delta(),
+        "route_hint_count": invoice.route_hints().len(),
+        "fallback_addresses": fallback_addresses,
+    }))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -218,7 +250,12 @@ fn main() -> Result<()> {
             )?;
             println!("{}", body["txid"].as_str().unwrap_or(&body.to_string()));
         }
-        Command::Lightning { bolt11 } => {
+        Command::Lightning { bolt11, decode } => {
+            if *decode {
+                let body = decode_invoice(bolt11)?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(());
+            }
             let token = get_token(&cli)?;
             let body = post_json(
                 &format!("{}/api/lightning", cli.url),

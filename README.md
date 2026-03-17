@@ -34,6 +34,14 @@ mutinynet-cli lightning <bolt11>
 
 Supports bolt11 invoices, LNURL, lightning addresses, and nostr npubs.
 
+### Decode a bolt11 invoice
+
+```sh
+mutinynet-cli lightning -d <bolt11>
+```
+
+Prints decoded bolt11 invoice details as JSON without attempting payment.
+
 ### Open a channel
 
 ```sh
