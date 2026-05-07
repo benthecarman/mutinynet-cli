@@ -5,6 +5,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lightning_invoice::Bolt11Invoice;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 const DEFAULT_URL: &str = "https://faucet.mutinynet.com";
@@ -66,6 +67,8 @@ enum Command {
         /// Amount in satoshis (omit for zero-amount)
         amount: Option<u64>,
     },
+    /// Show your remaining daily faucet limit
+    Limits,
 }
 
 fn home_dir() -> PathBuf {
@@ -179,11 +182,32 @@ struct ApiResponse {
     body: Value,
 }
 
+#[derive(Deserialize)]
+struct LimitsResponse {
+    max_daily_sats: u64,
+    user_used_sats: u64,
+    remaining_sats: u64,
+    is_premium: bool,
+    window_seconds: u64,
+}
+
 fn post_json_raw(url: &str, body: &Value, auth: Option<&str>) -> Result<ApiResponse> {
     let json_body = serde_json::to_string(body)?;
     let mut req = bitreq::post(url)
         .with_header("Content-Type", "application/json")
         .with_body(json_body.into_bytes());
+    if let Some(auth) = auth {
+        req = req.with_header("Authorization", auth);
+    }
+    let resp = req.send().context("Failed to send request")?;
+    let status_code = resp.status_code as u16;
+    let text = resp.as_str().unwrap_or("unknown error");
+    let body = serde_json::from_str(text).unwrap_or_else(|_| json!({"error": text}));
+    Ok(ApiResponse { status_code, body })
+}
+
+fn get_json_raw(url: &str, auth: Option<&str>) -> Result<ApiResponse> {
+    let mut req = bitreq::get(url);
     if let Some(auth) = auth {
         req = req.with_header("Authorization", auth);
     }
@@ -203,11 +227,8 @@ fn post_json(url: &str, body: &Value, auth: Option<&str>) -> Result<Value> {
     }
 }
 
-/// Make an authenticated POST request. On 401, clear stored credentials and
-/// tell the user to re-authenticate.
-fn authed_post(url: &str, body: &Value, cli: &Cli) -> Result<Value> {
-    let (auth, source) = get_auth_header(cli)?;
-    let resp = post_json_raw(url, body, Some(&auth))?;
+/// On 401, clear stored credentials and tell the user to re-authenticate.
+fn finish_authed(resp: ApiResponse, source: AuthSource) -> Result<Value> {
     if resp.status_code == 401 {
         clear_expired_credentials(source)
     } else if resp.status_code >= 200 && resp.status_code < 300 {
@@ -215,6 +236,16 @@ fn authed_post(url: &str, body: &Value, cli: &Cli) -> Result<Value> {
     } else {
         bail!("{}: {}", resp.status_code, resp.body)
     }
+}
+
+fn authed_post(url: &str, body: &Value, cli: &Cli) -> Result<Value> {
+    let (auth, source) = get_auth_header(cli)?;
+    finish_authed(post_json_raw(url, body, Some(&auth))?, source)
+}
+
+fn authed_get(url: &str, cli: &Cli) -> Result<Value> {
+    let (auth, source) = get_auth_header(cli)?;
+    finish_authed(get_json_raw(url, Some(&auth))?, source)
 }
 
 fn post_form(url: &str, body: &str) -> Result<Value> {
@@ -433,6 +464,26 @@ fn main() -> Result<()> {
                 None,
             )?;
             println!("{}", body["bolt11"].as_str().unwrap_or(&body.to_string()));
+        }
+        Command::Limits => {
+            let body = authed_get(&format!("{}/api/limits", cli.url), &cli)?;
+            let limits: LimitsResponse =
+                serde_json::from_value(body).context("Unexpected limits response")?;
+
+            if limits.is_premium {
+                println!("Premium account — no rate limit");
+                println!(
+                    "Used in last {}s: {} sats",
+                    limits.window_seconds, limits.user_used_sats
+                );
+            } else {
+                println!(
+                    "Daily limit: {} sats (rolling {}s window)",
+                    limits.max_daily_sats, limits.window_seconds
+                );
+                println!("Used:        {} sats", limits.user_used_sats);
+                println!("Remaining:   {} sats", limits.remaining_sats);
+            }
         }
     }
 

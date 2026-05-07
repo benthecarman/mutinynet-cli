@@ -56,6 +56,14 @@ mutinynet-cli bolt11 [amount]
 
 Omit amount for a zero-amount invoice.
 
+### Check your remaining daily limit
+
+```sh
+mutinynet-cli limits
+```
+
+Prints how many sats you've used and have left in the rolling 24h window.
+
 ## Configuration
 
 | Option | Env var | Default |
