@@ -3,12 +3,20 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
+use bitcoin::Network;
+use bitcoin_payment_instructions::amount::Amount;
+use bitcoin_payment_instructions::hrn_resolution::DummyHrnResolver;
+use bitcoin_payment_instructions::{
+    PaymentInstructions, PaymentMethod, PossiblyResolvedPaymentMethod,
+};
 use clap::{Parser, Subcommand};
 use lightning_invoice::Bolt11Invoice;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const DEFAULT_URL: &str = "https://faucet.mutinynet.com";
+/// Default amount of sats to request when none is specified.
+const DEFAULT_SATS: u64 = 10_000;
 
 #[derive(Parser)]
 #[command(name = "mutinynet-cli", about = "CLI for the Mutinynet faucet")]
@@ -37,9 +45,9 @@ enum Command {
     Onchain {
         /// Bitcoin address or BIP21 URI
         address: String,
-        /// Amount in satoshis
-        #[arg(default_value = "10000")]
-        sats: u64,
+        /// Amount in satoshis (defaults to the amount embedded in the BIP21 URI, or 10,000)
+        #[arg(long)]
+        sats: Option<u64>,
     },
     /// Pay or decode a lightning invoice, LNURL, or zap a nostr pubkey
     Lightning {
@@ -404,6 +412,64 @@ fn decode_invoice(bolt11: &str) -> Result<Value> {
     }))
 }
 
+/// Resolve a string (address, BIP21 URI, bolt11 invoice, LNURL, npub, lightning address...) into
+/// structured payment instructions, using the [`bitcoin-payment-instructions`] crate.
+///
+/// HRN/LNURL resolution is intentionally stubbed out with [`DummyHrnResolver`] since the faucet
+/// server performs that resolution itself; we only need local parsing to validate input and
+/// extract embedded amounts/addresses.
+fn parse_instructions(input: &str) -> Result<PaymentInstructions> {
+    pollster::block_on(PaymentInstructions::parse(
+        input,
+        Network::Signet,
+        &DummyHrnResolver,
+        false,
+    ))
+    .map_err(|e| anyhow::anyhow!("Failed to parse payment instructions: {e:?}"))
+}
+
+/// Parse a user-provided on-chain target (address or BIP21 URI) into an address and an optional
+/// amount. If the target is a BIP21 URI with an embedded amount and no explicit `--sats` was
+/// given, the embedded amount wins; otherwise `--sats` (or fall back to `DEFAULT_SATS`).
+fn parse_onchain_target(target: &str, explicit_sats: Option<u64>) -> Result<(String, u64)> {
+    let instructions = parse_instructions(target)?;
+
+    let (address, embedded_sats) = match &instructions {
+        PaymentInstructions::FixedAmount(fixed) => {
+            let address = fixed
+                .methods()
+                .iter()
+                .find_map(|m| match m {
+                    PaymentMethod::OnChain(a) => Some(a.to_string()),
+                    _ => None,
+                })
+                .context("No on-chain address found in payment instructions")?;
+            let sats = fixed.onchain_payment_amount().map(amount_to_sats);
+            (address, sats)
+        }
+        PaymentInstructions::ConfigurableAmount(conf) => {
+            let address = conf
+                .methods()
+                .find_map(|m| match m {
+                    PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::OnChain(a)) => {
+                        Some(a.to_string())
+                    }
+                    _ => None,
+                })
+                .context("No on-chain address found in payment instructions")?;
+            let sats = conf.min_amt().map(amount_to_sats);
+            (address, sats)
+        }
+    };
+
+    let sats = explicit_sats.or(embedded_sats).unwrap_or(DEFAULT_SATS);
+    Ok((address, sats))
+}
+
+fn amount_to_sats(amount: Amount) -> u64 {
+    amount.sats_rounding_up()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -416,9 +482,10 @@ fn main() -> Result<()> {
             }
         }
         Command::Onchain { address, sats } => {
+            let (address, sats) = parse_onchain_target(address, *sats)?;
             let body = authed_post(
                 &format!("{}/api/onchain", cli.url),
-                &json!({ "address": address, "sats": *sats }),
+                &json!({ "address": address, "sats": sats }),
                 &cli,
             )?;
             println!("{}", body["txid"].as_str().unwrap_or(&body.to_string()));
@@ -488,4 +555,53 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A valid signet address (P2WPKH) used in the tests below.
+    const TEST_ADDR: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    #[test]
+    fn parses_plain_address_with_default_amount() {
+        let (address, sats) = parse_onchain_target(TEST_ADDR, None).unwrap();
+        assert_eq!(address, TEST_ADDR);
+        assert_eq!(sats, DEFAULT_SATS);
+    }
+
+    #[test]
+    fn explicit_sats_overrides_default() {
+        let (_, sats) = parse_onchain_target(TEST_ADDR, Some(50_000)).unwrap();
+        assert_eq!(sats, 50_000);
+    }
+
+    #[test]
+    fn parses_bip21_embedded_amount() {
+        let uri = format!("bitcoin:{TEST_ADDR}?amount=0.0005"); // 50_000 sats
+        let (address, sats) = parse_onchain_target(&uri, None).unwrap();
+        assert_eq!(address, TEST_ADDR);
+        assert_eq!(sats, 50_000);
+    }
+
+    #[test]
+    fn bip21_amount_beats_default() {
+        let uri = format!("bitcoin:{TEST_ADDR}?amount=0.0005");
+        let (_, sats) = parse_onchain_target(&uri, None).unwrap();
+        assert_ne!(sats, DEFAULT_SATS);
+        assert_eq!(sats, 50_000);
+    }
+
+    #[test]
+    fn explicit_sats_beats_bip21_embedded_amount() {
+        let uri = format!("bitcoin:{TEST_ADDR}?amount=0.0005");
+        let (_, sats) = parse_onchain_target(&uri, Some(1_000)).unwrap();
+        assert_eq!(sats, 1_000);
+    }
+
+    #[test]
+    fn rejects_invalid_input() {
+        assert!(parse_onchain_target("not-an-address", None).is_err());
+    }
 }

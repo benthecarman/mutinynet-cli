@@ -21,10 +21,19 @@ mutinynet-cli login
 ### Request on-chain bitcoin
 
 ```sh
-mutinynet-cli onchain <address> [sats]
+mutinynet-cli onchain <address> [--sats <sats>]
 ```
 
-Default amount is 10,000 sats. Also accepts BIP21 URIs.
+Default amount is 10,000 sats. Also accepts BIP21 URIs:
+
+```sh
+mutinynet-cli onchain 'bitcoin:tb1q...?amount=0.0005'
+```
+
+When a BIP21 URI embeds an amount, that amount is used by default. An explicit `--sats` argument
+always overrides the embedded/default amount.
+
+Amounts are parsed and validated by the `bitcoin-payment-instructions` crate.
 
 ### Pay a lightning invoice
 

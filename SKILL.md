@@ -34,15 +34,18 @@ mutinynet-cli login
 
 ### Send on-chain bitcoin
 
-Send testnet bitcoin to an address. Default amount is 10,000 sats. Accepts Bitcoin addresses or BIP21 URIs.
+Send testnet bitcoin to an address. Default amount is 10,000 sats. Accepts Bitcoin addresses or BIP21 URIs; amounts are parsed and validated with the `bitcoin-payment-instructions` crate.
 
 ```bash
-mutinynet-cli onchain <address> [sats]
+mutinynet-cli onchain <address> [--sats <sats>]
 ```
 
 Examples:
 - `mutinynet-cli onchain tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx`
-- `mutinynet-cli onchain tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx 50000`
+- `mutinynet-cli onchain tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx --sats 50000`
+- `mutinynet-cli onchain 'bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx?amount=0.0005'`
+
+A BIP21 URI's embedded amount is used unless `--sats` is given.
 
 ### Pay a lightning invoice
 
@@ -56,18 +59,6 @@ Examples:
 - `mutinynet-cli lightning lnbc1...`
 - `mutinynet-cli lightning user@walletofsatoshi.com`
 
-### Open a lightning channel
-
-Open a lightning channel from the faucet node to your node.
-
-```bash
-mutinynet-cli channel <pubkey> <capacity> [--push-amount <sats>] [--host <host:port>]
-```
-
-Examples:
-- `mutinynet-cli channel 02abc...def 100000`
-- `mutinynet-cli channel 02abc...def 100000 --push-amount 50000 --host localhost:9735`
-
 ### Generate a bolt11 invoice
 
 Generate a bolt11 invoice from the faucet node. Omit amount for a zero-amount invoice.
@@ -79,6 +70,18 @@ mutinynet-cli bolt11 [amount]
 Examples:
 - `mutinynet-cli bolt11 5000`
 - `mutinynet-cli bolt11`
+
+### Open a lightning channel
+
+Open a lightning channel from the faucet node to your node.
+
+```bash
+mutinynet-cli channel <pubkey> <capacity> [--push-amount <sats>] [--host <host:port>]
+```
+
+Examples:
+- `mutinynet-cli channel 02abc...def 100000`
+- `mutinynet-cli channel 02abc...def 100000 --push-amount 50000 --host localhost:9735`
 
 ## Configuration
 
