@@ -2,6 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{bail, Context, Result};
 use bitcoin::Network;
 use bitcoin_payment_instructions::amount::Amount;
@@ -119,6 +122,13 @@ fn save_file(path: &PathBuf, contents: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, contents)?;
+
+    // Credential files must only be readable/writable by the owner.
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
     Ok(())
 }
 
@@ -603,5 +613,24 @@ mod tests {
     #[test]
     fn rejects_invalid_input() {
         assert!(parse_onchain_target("not-an-address", None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_credentials_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "mutinynet-test-token-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        save_file(&path, "s3cret").unwrap();
+
+        let perms = fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+
+        let _ = fs::remove_file(&path);
     }
 }
